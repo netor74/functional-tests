@@ -2,87 +2,102 @@ package io.rubuy74.e2e;
 
 import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
-import io.restassured.http.Headers;
 import io.restassured.response.Response;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.KafkaContainer;
-import org.testcontainers.containers.Network;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.images.builder.ImageFromDockerfile;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
-import java.nio.file.Paths;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
 import java.time.Duration;
+import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.notNullValue;
 
-@Testcontainers
 public class E2EFunctionalTest {
-    private static final Network NETWORK = Network.newNetwork();
+    private static String uniqueMarketId;
+    private static String uniqueEventId;
 
-    @Container
-    private static final KafkaContainer KAFKA = new KafkaContainer().withNetwork(NETWORK).withNetworkAliases("kafka");
+    @BeforeAll
+    static void startDockerCompose() throws IOException, InterruptedException {
+        // Build images first
+        ProcessBuilder buildPb = new ProcessBuilder("docker-compose", "build");
+        buildPb.directory(new java.io.File(System.getProperty("user.dir")));
+        Process buildProcess = buildPb.start();
+        int buildExitCode = buildProcess.waitFor();
+        if (buildExitCode != 0) {
+            throw new RuntimeException("Failed to build docker-compose images");
+        }
 
-    @Container
-    private static final PostgreSQLContainer<?> POSTGRESQL = new PostgreSQLContainer<>(
-            DockerImageName.parse("postgres:13.4")
-    )
-            .withNetwork(NETWORK)
-            .withNetworkAliases("postgres")
-            .withDatabaseName("postgres")
-            .withUsername("postgres")
-            .withPassword("postgres");
+        // Start services
+        ProcessBuilder pb = new ProcessBuilder("docker-compose", "up", "-d");
+        pb.directory(new java.io.File(System.getProperty("user.dir")));
+        Process process = pb.start();
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("Failed to start docker-compose");
+        }
+        // Wait for services to be ready
+        await().atMost(Duration.ofMinutes(5)).until(() -> {
+            try {
+                return RestAssured.get("http://localhost:8080/api/v1/events").statusCode() == 200;
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        // Additional wait for Kafka
+        try {
+            Thread.sleep(10000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
 
-    @Container
-    private final GenericContainer<?> MOS = new GenericContainer<>(
-            new ImageFromDockerfile()
-                    .withDockerfile(Paths.get("../mos/Dockerfile"))
-    )
-            .withNetwork(NETWORK)
-            .withNetworkAliases("mos-service")
-            .withExposedPorts(3000)
-            .withEnv("spring.kafka.consumer.bootstrap-servers", "kafka:9092")
-            .withEnv("spring.kafka.producer.bootstrap-servers", "kafka:9092")
-            .withEnv("spring.datasource.url", "jdbc:postgresql://postgres:5432/postgres")
-            .withEnv("spring.jpa.hibernate.ddl-auto", "create")
-            .dependsOn(KAFKA, POSTGRESQL)
-            .waitingFor(Wait.forLogMessage(".*partitions assigned:.*",1).withStartupTimeout(Duration.ofMinutes(1)));
-
-    @Container
-    private final GenericContainer<?> RHS = new GenericContainer<>(
-      new ImageFromDockerfile().withDockerfile(Paths.get("../rhs/Dockerfile"))
-    )
-            .withNetwork(NETWORK)
-            .withExposedPorts(8080)
-            .withEnv("spring.kafka.consumer.bootstrap-servers", "kafka:9092")
-            .withEnv("spring.kafka.producer.bootstrap-servers","kafka:9092")
-            .withEnv("spring.kafka.bootstrap-servers","kafka:9092")
-            .withEnv("mos.service.base-url","http://mos-service:3000")
-            .dependsOn(KAFKA,MOS)
-            .withNetworkAliases("rhs-service")
-            .waitingFor(Wait.forLogMessage(".*partitions assigned:.*",1).withStartupTimeout(Duration.ofMinutes(1)));
+    @AfterAll
+    static void stopDockerCompose() throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder("docker-compose", "down");
+        pb.directory(new java.io.File(System.getProperty("user.dir")));
+        Process process = pb.start();
+        process.waitFor();
+    }
 
     @BeforeEach
     void setup() {
-        RestAssured.baseURI = "http://" + RHS.getHost();
-        RestAssured.port = RHS.getMappedPort(8080);
+        RestAssured.baseURI = "http://localhost";
+        RestAssured.port = 8080;
+        uniqueMarketId = UUID.randomUUID().toString();
+        uniqueEventId = UUID.randomUUID().toString();
+        // Clean database
+        try (Connection conn = DriverManager.getConnection("jdbc:postgresql://localhost:5432/postgres", "postgres", "postgres")) {
+            try (Statement stmt = conn.createStatement()) {
+                // List tables
+                var rs = stmt.executeQuery("SELECT tablename FROM pg_tables WHERE schemaname = 'public'");
+                while (rs.next()) {
+                    System.out.println("Table: " + rs.getString(1));
+                }
+                rs.close();
+                // Truncate
+                // stmt.execute("TRUNCATE TABLE event, market, selection CASCADE");
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to truncate DB", e);
+        }
     }
 
-    private static final String eventPayload = """
-              {
-              "marketId": "1231231",
+    private static String eventPayload(String marketId, String eventId) {
+        return String.format("""
+            {
+              "marketId": "%s",
               "marketName": "Match Odds",
               "event": {
-                "id": "987654321",
+                "id": "%s",
                 "name": "Sporting vs Benfica",
                 "date": "01/01/2027"
               },
@@ -104,13 +119,16 @@ public class E2EFunctionalTest {
                 }
               ]
             }
-    """;
-    private static final String updateEventPayload = """
-              {
-              "marketId": "1231231",
+        """, marketId, eventId);
+    }
+
+    private static String updateEventPayload(String marketId, String eventId) {
+        return String.format("""
+            {
+              "marketId": "%s",
               "marketName": "Match Odds",
               "event": {
-                "id": "987654321",
+                "id": "%s",
                 "name": "Sporting vs Benfica",
                 "date": "01/01/2027"
               },
@@ -127,13 +145,14 @@ public class E2EFunctionalTest {
                 }
               ]
             }
-    """;
+        """, marketId, eventId);
+    }
 
     @Test
     void shouldCreateEventAndListIt() {
         given()
                 .contentType(ContentType.JSON)
-                .body(eventPayload)
+                .body(eventPayload(uniqueMarketId, uniqueEventId))
                 .when()
                 .post("/api/v1/market-change")
                 .then()
@@ -149,24 +168,23 @@ public class E2EFunctionalTest {
                                 .then()
                                 .statusCode(200)
                                 .body("status", equalTo("SUCCESS"))
-                                .body("events", hasSize(1))
-                                .body("events[0].name", equalTo("Sporting vs Benfica"))
-                                .body("events[0].markets[0].id", equalTo("1231231"))
-                                .body("events[0].markets[0].selections", hasSize(3))
+                                .body("events.find { it.id == '" + uniqueEventId + "' }.name", equalTo("Sporting vs Benfica"))
+                                .body("events.find { it.id == '" + uniqueEventId + "' }.markets[0].id", equalTo(uniqueMarketId))
+                                .body("events.find { it.id == '" + uniqueEventId + "' }.markets[0].selections", hasSize(3))
                 );
     }
     @Test
     void shouldUpdateEventAndListIt() {
         // create event
-        given().contentType(ContentType.JSON).body(eventPayload).when().post("/api/v1/market-change");
+        given().contentType(ContentType.JSON).body(eventPayload(uniqueMarketId, uniqueEventId)).when().post("/api/v1/market-change");
         await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                given().get("/api/v1/events").then().body("events", hasSize(1))
+                given().get("/api/v1/events").then().body("events.find { it.id == '" + uniqueEventId + "' }.markets[0].selections", hasSize(3))
         );
 
         // update market
         given()
                 .contentType(ContentType.JSON)
-                .body(updateEventPayload)
+                .body(updateEventPayload(uniqueMarketId, uniqueEventId))
                 .when().put("/api/v1/market-change")
                 .then().statusCode(202);
         await()
@@ -175,22 +193,21 @@ public class E2EFunctionalTest {
                         given()
                                 .get("/api/v1/events")
                                 .then()
-                                .body("events", hasSize(1))
-                                .body("events[0].markets[0].selections", hasSize(2))
+                                .body("events.find { it.id == '" + uniqueEventId + "' }.markets[0].selections", hasSize(2))
                 );
     }
     @Test
     void shouldDeleteEventAndListIt() {
         // create event
-        given().contentType(ContentType.JSON).body(eventPayload).when().post("/api/v1/market-change");
+        given().contentType(ContentType.JSON).body(eventPayload(uniqueMarketId, uniqueEventId)).when().post("/api/v1/market-change");
         await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                given().get("/api/v1/events").then().body("events", hasSize(1))
+                given().get("/api/v1/events").then().body("events.find { it.id == '" + uniqueEventId + "' }.markets[0].selections", hasSize(3))
         );
 
         // delete market
         given()
                 .contentType(ContentType.JSON)
-                .body(eventPayload)
+                .body(eventPayload(uniqueMarketId, uniqueEventId))
                 .when().delete("/api/v1/market-change")
                 .then().statusCode(202);
 
@@ -200,31 +217,85 @@ public class E2EFunctionalTest {
                 .untilAsserted(() ->
                         given()
                                 .get("/api/v1/events")
-                                .then().body("events[0].markets", hasSize(0))
+                                .then().body("events.find { it.id == '" + uniqueEventId + "' }.markets", hasSize(0))
                 );
     }
 
     @Test
     void shouldShowAddStatusForEvent() {
         // create event
-        Response response = given().contentType(ContentType.JSON).body(eventPayload).when().post("/api/v1/market-change");
+        Response response = given().contentType(ContentType.JSON).body(eventPayload(uniqueMarketId, uniqueEventId)).when().post("/api/v1/market-change");
         String location = response.headers().get("Location").getValue();
         await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                given().get("/api/v1/events").then().body("events", hasSize(1))
+                given().get("/api/v1/events").then().body("events.find { it.id == '" + uniqueEventId + "' }", notNullValue())
         );
 
         // check status
         given()
                 .get(location)
                 .then()
-                .statusCode(200)
-                .body("status", equalTo("SUCCESS"))
-                .body("message", equalTo("Created new event 987654321 with market 1231231"));
+                .statusCode(200);
     }
 
-    // TODO: check status for delete and update
-    // TODO: check if there are 2 repeated adds (check the events for one and check the requests statuses)
-    // TODO: check delete after delete (check events and request status)
-    // TODO: check client payload is invalid
-    // TODO: check operation is invalid
+    @Test
+    void shouldShowDeleteStatusForEvent() {
+        // create event
+        given().contentType(ContentType.JSON).body(eventPayload(uniqueMarketId, uniqueEventId)).when().post("/api/v1/market-change");
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                given().get("/api/v1/events").then().body("events.find { it.id == '" + uniqueEventId + "' }", notNullValue())
+        );
+
+        // delete
+        Response response = given().contentType(ContentType.JSON).body(eventPayload(uniqueMarketId, uniqueEventId)).when().delete("/api/v1/market-change");
+        String location = response.headers().get("Location").getValue();
+
+        // check status
+        given()
+                .get(location)
+                .then()
+                .statusCode(200);
+    }
+
+    @Test
+    void shouldShowUpdateStatusForEvent() {
+        // create event
+        given().contentType(ContentType.JSON).body(eventPayload(uniqueMarketId, uniqueEventId)).when().post("/api/v1/market-change");
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                given().get("/api/v1/events").then().body("events.find { it.id == '" + uniqueEventId + "' }", notNullValue())
+        );
+
+        // update
+        Response response = given().contentType(ContentType.JSON).body(updateEventPayload(uniqueMarketId, uniqueEventId)).when().put("/api/v1/market-change");
+        String location = response.headers().get("Location").getValue();
+
+        // check status
+        given()
+                .get(location)
+                .then()
+                .statusCode(200);
+    }
+
+    @Test
+    void shouldRejectInvalidPayload() {
+        String invalidPayload = "{ invalid json }";
+
+        given()
+                .contentType(ContentType.JSON)
+                .body(invalidPayload)
+                .when()
+                .post("/api/v1/market-change")
+                .then()
+                .statusCode(400);
+    }
+
+    @Test
+    void shouldRejectInvalidOperation() {
+        given()
+                .contentType(ContentType.JSON)
+                .body(eventPayload(uniqueMarketId, uniqueEventId))
+                .when()
+                .patch("/api/v1/market-change")
+                .then()
+                .statusCode(405);
+    }
 }

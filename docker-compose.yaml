@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  kafka:
+    image: apache/kafka:latest
+    hostname: kafka
+    environment:
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+    ports:
+      - "9093:9093"
+    networks:
+      - e2e-network
+
+  postgres:
+    image: postgres:13.4
+    hostname: postgres
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    networks:
+      - e2e-network
+
+  mos:
+    build:
+      context: ../mos
+      dockerfile: Dockerfile
+    hostname: mos-service
+    networks:
+      - e2e-network
+    ports:
+      - "3000:3000"
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - spring.kafka.consumer.bootstrap-servers=kafka:9092
+      - spring.kafka.producer.bootstrap-servers=kafka:9092
+      - spring.datasource.url=jdbc:postgresql://postgres:5432/postgres
+      - spring.jpa.hibernate.ddl-auto=create-drop
+
+  rhs:
+    build:
+      context: ../rhs
+      dockerfile: Dockerfile
+    hostname: rhs-service
+    networks:
+      - e2e-network
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kafka
+      - mos
+    environment:
+      - spring.kafka.producer.bootstrap-servers=kafka:9092
+      - spring.kafka.consumer.bootstrap-servers=kafka:9092
+      - mos.service.base-url=http://mos-service:3000
+
+networks:
+  e2e-network:
+    driver: bridge
